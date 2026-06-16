@@ -115,8 +115,23 @@ const tools: OpenAI.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "check_page",
-      description: "获取当前页面的概览信息（标题、URL、页面标题/区域文本），用于判断当前所在页面和任务是否完成",
+      description: "获取当前页面的概览信息（标题、URL、页面标题/区域文本、关键规则/要求），用于判断当前所在页面和任务是否完成",
       parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "wait",
+      description: "在当前页面等待指定的秒数。用于需要在页面停留的场景（如：等待视频播放、等待倒计时、等待页面渲染完成、满足页面要求的停留时长等）",
+      parameters: {
+        type: "object",
+        properties: {
+          seconds: { type: "number", description: "等待的秒数，例如 60 表示等待1分钟" },
+          reason: { type: "string", description: "等待的原因，例如'页面要求停留60秒'或'等待视频加载完成'" }
+        },
+        required: ["seconds"]
+      }
     }
   },
   {
@@ -255,25 +270,191 @@ async function executeTool(browser: Browser, page: Page, toolName: string, args:
 
       case "check_page": {
         const info = await page.evaluate(() => {
+          // 辅助：格式化秒数为 MM:SS
+          const fmtTime = (s: number): string => {
+            if (isNaN(s) || !isFinite(s) || s < 0) return "--:--";
+            const min = Math.floor(s / 60);
+            const sec = Math.floor(s % 60);
+            return `${min}:${sec.toString().padStart(2, "0")}`;
+          };
+
+          // 辅助：元素是否可见
+          const isVisible = (el: Element): boolean => {
+            const style = window.getComputedStyle(el);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+
+          // === 标题 ===
           const headings: string[] = [];
           document.querySelectorAll("h1, h2, h3, h4, .title, [class*='title'], [class*='header']").forEach(el => {
             const t = (el as HTMLElement).innerText?.trim().slice(0, 80);
             if (t) headings.push(t);
           });
-          // 获取页面核心文本区域
-          const mainText = document.body?.innerText?.slice(0, 800) || "";
+
+          // === 正文 ===
+          const mainText = document.body?.innerText?.slice(0, 1000) || "";
+
+          // === 规则/要求提取 ===
+          const ruleKeywords = /(注意|提示|说明|规则|要求|重要|条件|限制|警告|必须|需要|至少|最多|不得|禁止|步骤|流程|指南|分钟|秒|小时|每天|每日|每周|完成|未完成|待完成|剩余|进度|状态|倒计时|截止|期限|有效期|次数|机会|上限|下限|累计\d+|总共|合计|通过|note|warning|important|caution|hint|info|tip|required|must|should|need|condition|requirement|rule|instruction|step|completed|pending|remaining|progress|status|deadline|expir|limit|minimum|maximum)/i;
+          const seenRules = new Set<string>();
+          const rules: string[] = [];
+          document.querySelectorAll("p, li, div, span, td, .rule, .requirement, .notice, .tip, [class*='rule'], [class*='tip'], [class*='notice'], [class*='score'], [class*='point'], [class*='requirement'], [class*='condition'], [class*='desc']").forEach(el => {
+            const t = (el as HTMLElement).innerText?.trim();
+            if (t && t.length >= 8 && t.length < 400 && ruleKeywords.test(t)) {
+              const dedupKey = t.slice(0, 60);
+              if (!seenRules.has(dedupKey)) {
+                seenRules.add(dedupKey);
+                rules.push(t.slice(0, 250));
+              }
+            }
+          });
+
+          // === 动态状态：媒体（video/audio）===
+          const media: Record<string, any>[] = [];
+          document.querySelectorAll("video, audio").forEach(el => {
+            if (!isVisible(el)) return;
+            const m = el as HTMLMediaElement;
+            const dur = m.duration;
+            const cur = m.currentTime;
+            const pct = isFinite(dur) && dur > 0 ? Math.round((cur / dur) * 100) : null;
+            // 尝试获取标签
+            let label = m.getAttribute("aria-label") || m.getAttribute("title") || "";
+            if (!label) {
+              const heading = m.closest("section, article, div, li")?.querySelector("h1, h2, h3, h4, h5, strong, .title, [class*='title']");
+              if (heading) label = heading.textContent?.trim().slice(0, 40) || "";
+            }
+            media.push({
+              tag: m.tagName.toLowerCase(),
+              label: label.slice(0, 50),
+              playing: !m.paused && !m.ended,
+              ended: m.ended,
+              current: fmtTime(cur),
+              duration: fmtTime(dur),
+              progress: pct !== null ? `${pct}%` : "未知",
+              muted: m.muted,
+            });
+          });
+
+          // === 动态状态：进度条（<progress> / role="progressbar"）===
+          const progress: Record<string, any>[] = [];
+          document.querySelectorAll("progress, [role='progressbar']").forEach(el => {
+            if (!isVisible(el)) return;
+            let label = el.getAttribute("aria-label") || el.getAttribute("title") || "";
+            let value: number | null = null;
+            let max: number | null = null;
+            let pct = "";
+
+            if (el.tagName.toLowerCase() === "progress") {
+              const p = el as HTMLProgressElement;
+              value = p.value;
+              max = p.max;
+              if (p.max > 0) pct = `${Math.round((p.value / p.max) * 100)}%`;
+            } else {
+              const now = el.getAttribute("aria-valuenow");
+              const ariaMax = el.getAttribute("aria-valuemax");
+              const ariaText = el.getAttribute("aria-valuetext");
+              if (now) value = parseFloat(now);
+              if (ariaMax) max = parseFloat(ariaMax);
+              if (ariaText) pct = ariaText;
+              else if (value !== null && max && max > 0) pct = `${Math.round((value / max) * 100)}%`;
+            }
+
+            if (!label) {
+              const parent = el.closest("div, section, li");
+              if (parent) {
+                const labelEl = parent.querySelector("span, label, strong, em, h4, h5, h6");
+                if (labelEl) label = labelEl.textContent?.trim().slice(0, 40) || "";
+              }
+            }
+            if (!label) label = el.textContent?.trim().slice(0, 40) || "";
+
+            progress.push({ label: label.slice(0, 50), value, max, pct });
+          });
+
+          // === 动态状态：可见倒计时/计时器文本 ===
+          const timerPatterns = [
+            /\d{1,2}:\d{2}(:\d{2})?/,           // MM:SS or HH:MM:SS
+            /倒计时\s*\d+/,
+            /剩余\s*\d+\s*(秒|分钟|小时|天)/,
+            /还剩\s*\d+\s*(秒|分钟|小时|天)/,
+            /countdown\s*\d+/i,
+            /remaining\s*\d+/i,
+            /\d+\s*(seconds?|minutes?|hours?)\s*(remaining|left)/i,
+          ];
+          const seenTimers = new Set<string>();
+          const timers: string[] = [];
+          document.querySelectorAll("span, div, p, .timer, .countdown, [class*='timer'], [class*='countdown'], [class*='time']").forEach(el => {
+            if (!isVisible(el)) return;
+            const t = (el as HTMLElement).innerText?.trim();
+            if (!t || t.length > 50) return;
+            for (const pat of timerPatterns) {
+              if (pat.test(t)) {
+                const key = t.slice(0, 30);
+                if (!seenTimers.has(key)) {
+                  seenTimers.add(key);
+                  timers.push(t.slice(0, 40));
+                }
+                break;
+              }
+            }
+          });
+
           return {
             title: document.title,
             url: window.location.href,
             headings: [...new Set(headings)].slice(0, 15),
+            rules: rules.slice(0, 20),
             bodyPreview: mainText.replace(/\n{3,}/g, "\n\n"),
+            media,
+            progress,
+            timers,
           };
         });
+
+        // === 组装输出 ===
+        const rulesSection = info.rules.length > 0
+          ? `\n  ⚠️ 关键规则/要求:\n${info.rules.map(r => `    "${r}"`).join("\n")}`
+          : "\n  (未检测到明确的规则/要求文本)";
+
+        // 动态状态段：只在有内容时才输出
+        const dynamicLines: string[] = [];
+        if (info.media.length > 0) {
+          const mediaStrs = info.media.map(m => {
+            const state = m.ended ? "已结束" : m.playing ? "播放中" : "已暂停";
+            const label = m.label ? ` "${m.label}"` : "";
+            return `${m.tag}${label} ${state} ${m.current}/${m.duration} (${m.progress})${m.muted ? " [静音]" : ""}`;
+          });
+          dynamicLines.push(`  媒体:\n${mediaStrs.map(s => `    ${s}`).join("\n")}`);
+        }
+        if (info.progress.length > 0) {
+          const progStrs = info.progress.map(p => {
+            const label = p.label ? ` "${p.label}"` : "";
+            return `${label} ${p.pct || `${p.value}/${p.max}`}`;
+          });
+          dynamicLines.push(`  进度:\n${progStrs.map(s => `    ${s}`).join("\n")}`);
+        }
+        if (info.timers.length > 0) {
+          dynamicLines.push(`  计时:\n${info.timers.map(t => `    "${t}"`).join("\n")}`);
+        }
+        const dynamicSection = dynamicLines.length > 0
+          ? `\n动态状态:\n${dynamicLines.join("\n")}`
+          : "";
+
         return `页面概览:
   URL: ${info.url}
   标题: ${info.title}
-  页面区域:\n${info.headings.map(h => `  - ${h}`).join("\n")}
+  页面区域:\n${info.headings.map(h => `  - ${h}`).join("\n")}${rulesSection}${dynamicSection}
   正文预览:\n${info.bodyPreview}`;
+      }
+
+      case "wait": {
+        const seconds = Math.min(Math.max(args.seconds || 1, 1), 300); // 1-300秒
+        const reason = args.reason || "未说明";
+        console.log(`⏳ 等待 ${seconds} 秒... (${reason})`);
+        await page.waitForTimeout(seconds * 1000);
+        return `已等待 ${seconds} 秒（原因：${reason}）。如果还需要继续等待，可以再次调用 wait。`;
       }
 
       case "navigate":
@@ -334,61 +515,175 @@ async function executeTool(browser: Browser, page: Page, toolName: string, args:
   }
 }
 
-// 2. 页面状态提取：提取可交互元素 + 导航/文本元素，告诉 LLM 页面结构和可操作项
+// 2. 页面状态提取：分类提取可交互元素 + 输入元素 + 标题，帮助 LLM 理解页面
 async function getPageState(page: Page): Promise<string> {
+  // tsx 转译会在 Playwright 序列化的函数中注入 __name() 调用，需提前在浏览器环境定义
+  await page.evaluate("var __name = function(fn, name) { return fn; };");
   return await page.evaluate(() => {
-    const elements: string[] = [];
-    const seen = new Set<string>(); // 去重
+    const seen = new Set<string>();
+    const captured = new Set<Element>();
 
-    // 选择器覆盖：链接、按钮、输入框、导航项、有文本的块级元素
-    const selectors = [
-      "a", "button", "input", "textarea", "select",
+    const inViewport = (rect: DOMRect): boolean => {
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      if (rect.bottom < -200 || rect.top > window.innerHeight + 200) return false;
+      return true;
+    };
+
+    const buildDesc = (el: Element, tag: string): string | null => {
+      const rect = el.getBoundingClientRect();
+      if (!inViewport(rect)) return null;
+
+      const htmlEl = el as HTMLElement;
+      const text = htmlEl.innerText?.trim().slice(0, 50) || "";
+      const placeholder = htmlEl.getAttribute("placeholder") || "";
+      const ariaLabel = htmlEl.getAttribute("aria-label") || "";
+      const href = htmlEl.getAttribute("href")?.slice(0, 60) || "";
+      const role = htmlEl.getAttribute("role") || "";
+      const type = htmlEl.getAttribute("type") || "";
+      const cls = htmlEl.className?.toString().slice(0, 40) || "";
+      const clsLower = cls.toLowerCase();
+
+      const key = `${tag}|${text}|${Math.round(rect.x)}|${Math.round(rect.y)}`;
+      if (seen.has(key)) return null;
+      seen.add(key);
+
+      let desc = `<${tag}`;
+      if (text) desc += ` text="${text}"`;
+      if (placeholder) desc += ` placeholder="${placeholder}"`;
+      if (ariaLabel) desc += ` aria-label="${ariaLabel}"`;
+      if (href) desc += ` href="${href}"`;
+      if (role) desc += ` role="${role}"`;
+      if (type && type !== "text") desc += ` type="${type}"`;
+      // 只展示有意义的 class（交互/导航相关）
+      if (clsLower && /nav|menu|tab|btn|button|link|login|sign|auth|toolbar|header|top|side|item|action|click|search|icon|logo|user|avatar|dropdown|popup|modal|drawer/.test(clsLower)) {
+        desc += ` class="${cls}"`;
+      }
+      desc += `>`;
+      return desc;
+    };
+
+    const collect = (selectors: string[], category: string, target: string[]): void => {
+      selectors.forEach(selector => {
+        try {
+          document.querySelectorAll(selector).forEach(el => {
+            if (captured.has(el)) return;
+            const tag = el.tagName.toLowerCase();
+            const desc = buildDesc(el, tag);
+            if (desc) {
+              target.push(`[${category}] ${desc}`);
+              captured.add(el);
+            }
+          });
+        } catch {}
+      });
+    };
+
+    // === Phase 1: 已知可交互元素的选择器 ===
+    const interactiveSelectors = [
+      // 核心可交互
+      "a", "button", "summary", "details",
+      // ARIA 交互角色
       "[role='button']", "[role='link']", "[role='tab']", "[role='menuitem']",
-      "[onclick]", "[href]",
-      "nav a", "nav span", "nav li",
-      "li a", "li span", "li button",
-      "h1", "h2", "h3", "h4",
+      "[role='option']", "[role='treeitem']", "[role='switch']", "[role='checkbox']",
+      "[role='radio']", "[role='combobox']", "[role='searchbox']", "[role='slider']",
+      // 属性
+      "[onclick]", "[href]", "[tabindex]",
+      "[data-action]", "[data-href]", "[data-url]", "[data-click]", "[data-link]",
+      "[data-route]", "[data-path]", "[data-to]",
+      // 导航区域
+      "nav a", "nav button", "nav span", "nav div", "nav li",
+      "header a", "header button", "header span", "header div",
+      "[class*='navbar'] a", "[class*='navbar'] button", "[class*='navbar'] span", "[class*='navbar'] div",
+      "[class*='nav'] a", "[class*='nav'] button", "[class*='nav'] span",
+      "[class*='menu'] a", "[class*='menu'] button", "[class*='menu'] span", "[class*='menu'] li",
+      "[class*='toolbar'] a", "[class*='toolbar'] button", "[class*='toolbar'] span",
+      "[class*='top-bar'] a", "[class*='top-bar'] button", "[class*='top-bar'] span", "[class*='top-bar'] div",
+      "[class*='header'] a", "[class*='header'] button", "[class*='header'] span",
+      "[class*='sidebar'] a", "[class*='sidebar'] button", "[class*='sidebar'] span", "[class*='sidebar'] div",
+      "[class*='drawer'] a", "[class*='drawer'] button", "[class*='drawer'] span",
+      "[class*='dropdown'] a", "[class*='dropdown'] button", "[class*='dropdown'] span", "[class*='dropdown'] li",
+      "[class*='popup'] a", "[class*='popup'] button", "[class*='popup'] span",
+      "[class*='modal'] a", "[class*='modal'] button", "[class*='modal'] span",
+      // 列表项（常用于菜单/设置）
+      "li a", "li button", "li span", "li div",
+      "li[class*='item']",
+      // class 名称启发式
+      "[class*='btn']", "[class*='button']",
+      "[class*='link']", "[class*='clickable']",
+      "[class*='login']", "[class*='sign-in']", "[class*='signin']", "[class*='sign-up']", "[class*='signup']",
+      "[class*='auth']", "[class*='account']",
+      "[class*='action']", "[class*='click']",
+      "[class*='entry']", "[class*='item']",
     ];
 
-    selectors.forEach(selector => {
-      try {
-        document.querySelectorAll(selector).forEach(el => {
-          const rect = el.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) return;
-          // 跳过视口外的元素（离视口太远的不报）
-          if (rect.bottom < -200 || rect.top > window.innerHeight + 200) return;
+    const interactive: string[] = [];
+    collect(interactiveSelectors, "可点击", interactive);
 
-          const htmlEl = el as HTMLElement;
-          const tag = htmlEl.tagName.toLowerCase();
-          const text = htmlEl.innerText?.trim().slice(0, 50) || "";
-          const placeholder = htmlEl.getAttribute("placeholder") || "";
-          const ariaLabel = htmlEl.getAttribute("aria-label") || "";
-          const href = htmlEl.getAttribute("href")?.slice(0, 60) || "";
-          const role = htmlEl.getAttribute("role") || "";
-          const className = htmlEl.className?.toString().slice(0, 40) || "";
+    // === Phase 2: 输入元素 ===
+    const inputSelectors = [
+      "input:not([type='hidden'])", "textarea", "select",
+      "[role='textbox']", "[role='searchbox']", "[role='combobox']",
+      "[contenteditable='true']",
+    ];
+    const inputs: string[] = [];
+    collect(inputSelectors, "输入", inputs);
 
-          // 组合去重 key（文本+标签+位置）
-          const key = `${tag}|${text}|${Math.round(rect.x)}|${Math.round(rect.y)}`;
-          if (seen.has(key)) return;
-          seen.add(key);
+    // === Phase 3: cursor:pointer 扫描（捕获遗漏的 JS/CSS 驱动的可点击元素） ===
+    const pointerElements: string[] = [];
+    const scanElements = document.querySelectorAll("div, span, li, td, th, dt, dd, label, em, strong, i, b, u, p");
+    let cursorChecks = 0;
+    const MAX_CURSOR_CHECKS = 300;
+    for (const el of scanElements) {
+      if (captured.has(el)) continue;
+      if (cursorChecks >= MAX_CURSOR_CHECKS) break;
+      const rect = el.getBoundingClientRect();
+      if (!inViewport(rect)) continue;
+      const htmlEl = el as HTMLElement;
+      const text = htmlEl.innerText?.trim();
+      if (!text || text.length < 2) continue; // 跳过空元素和单字符
+      cursorChecks++;
+      const style = window.getComputedStyle(htmlEl);
+      if (style.cursor === "pointer") {
+        const tag = htmlEl.tagName.toLowerCase();
+        const desc = buildDesc(el, tag);
+        if (desc) {
+          pointerElements.push(`[可点击] ${desc}`);
+          captured.add(el);
+        }
+      }
+    }
 
-          let desc = `<${tag}`;
-          if (text) desc += ` text="${text}"`;
-          if (placeholder) desc += ` placeholder="${placeholder}"`;
-          if (ariaLabel) desc += ` aria-label="${ariaLabel}"`;
-          if (href) desc += ` href="${href}"`;
-          if (role) desc += ` role="${role}"`;
-          if (className && (className.includes("nav") || className.includes("menu") || className.includes("tab") || className.includes("btn"))) {
-            desc += ` class="${className}"`;
-          }
-          desc += `>`;
+    // === Phase 4: 标题（页面结构上下文） ===
+    const headingSelectors = ["h1", "h2", "h3", "h4"];
+    const headings: string[] = [];
+    collect(headingSelectors, "标题", headings);
 
-          elements.push(desc);
-        });
-      } catch {}
-    });
+    // === 组装输出：可交互优先 ===
+    const result: string[] = [];
+    if (interactive.length > 0) {
+      result.push(`=== 可交互 (${interactive.length}) ===`);
+      result.push(...interactive.slice(0, 120));
+    }
+    if (pointerElements.length > 0) {
+      result.push(`\n=== 可交互-cursor扫描 (${pointerElements.length}) ===`);
+      result.push(...pointerElements.slice(0, 40));
+    }
+    if (inputs.length > 0) {
+      result.push(`\n=== 输入 (${inputs.length}) ===`);
+      result.push(...inputs.slice(0, 15));
+    }
+    if (headings.length > 0) {
+      result.push(`\n=== 标题 (${headings.length}) ===`);
+      result.push(...headings.slice(0, 10));
+    }
 
-    return elements.slice(0, 150).join("\n"); // 限制最多 150 个元素，避免 token 爆炸
+    // Fallback: 如果可交互元素太少，追加 body 文本预览
+    if (interactive.length + pointerElements.length < 5) {
+      const bodyText = document.body?.innerText?.slice(0, 400) || "";
+      result.push(`\n=== 页面文本预览（可交互元素较少） ===\n${bodyText}`);
+    }
+
+    return result.join("\n") || "(页面为空或尚未加载)";
   });
 }
 
@@ -413,34 +708,88 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
   const messages: OpenAI.ChatCompletionMessageParam[] = [
     {
       role: "system",
-      content: `你是一个浏览器操作助手。你的目标是高效完成用户给定的任务。完成任务后调用 finish_task 汇报结果，浏览器会保持打开以等待下一个任务。
+      content: `你是一个通用浏览器操作助手。你的核心能力是**理解任务**并**逐步执行**，而不是依赖预设的场景模板。
 
-## 核心工作流程
-1. 收到任务 → 分析需要做什么 → 执行操作 → 验证结果 → 调用 finish_task
-2. 每完成一个步骤后，问自己："任务目标是否已达成？" 如果是，立即 finish_task
+## 任务理解框架
 
-## 任务完成判断（重要！）
-- 涉及登录的任务：手动验证通过后，用 check_page 检查页面 URL/标题是否已变为登录后的首页。如果是，任务完成。
-- 通用规则：当前页面状态是否满足用户任务的全部要求？不够就继续操作，够了就 finish_task。
-- 不确定时用 check_page 确认当前页面状态再决定。
+收到任务后，先在心中完成拆解：
+
+### 1. 明确目标
+用户最终想要达成什么结果？常见的任务类型：
+- **获取信息**：查找、阅读、提取页面中的特定内容
+- **执行操作**：填写表单、提交数据、点击特定按钮完成流程
+- **满足条件**：达到某个数量、停留足够时长、完成一系列步骤
+- **状态确认**：检查某个东西是否存在、某个状态是否达成
+
+### 2. 识别约束
+任务中有哪些显式或隐式的要求？
+- 有没有数量/时长/次数的限制？
+- 有没有特定的操作顺序或路径要求？
+- 有没有需要满足的前置条件？
+
+### 3. 定义完成标准
+什么现象说明任务已经完成？
+- 页面出现了特定的内容或状态变化
+- 某个条件被满足（数字达标、操作序列完成）
+- 看到了确认/成功提示
+
+## 执行循环
+
+每一步都遵循：**观察 → 推理 → 行动 → 验证**
+
+### 观察
+- 调用 check_page 了解当前页面：URL、标题、页面结构
+- 注意页面中的关键信息：说明文字、提示、规则、表单、列表等
+- **关注动态状态**：check_page 会报告媒体播放状态（播放中/暂停/已结束）、进度条、倒计时 — 这些是判断任务进度的核心依据。例如视频已结束 → 可进入下一步；进度 50% → 任务进行中；倒计时未归零 → 继续等待
+- 查看可交互元素列表，了解当前可用的操作
+
+### 推理
+- 当前页面和任务目标是什么关系？我在正确的位置吗？
+- 页面上的信息对推进任务有什么帮助或限制？
+- 我离目标还有多远？下一步应该做什么？
+
+### 行动
+- 选择最合适的工具执行操作
+- 一次专注于一个操作，确保可控
+
+### 验证
+- 操作后的状态是否符合预期？查看反馈中的 URL 和媒体状态
+- **涉及媒体（视频/音频）时**：点击链接后，先看反馈中的「媒体状态」确认是否开始播放。如果显示"已暂停"或没有媒体状态 → 需要点击播放按钮。确认播放中 → 再根据时长决定 wait 多久。视频显示"已结束" → 当前视频已完成，推进到下一个
+- 如果失败：是定位问题还是逻辑问题？换一种策略重试
+- 如果成功：按照原计划，下一步应该做什么？
+
+## 操作原则
+
+- **持续执行**：没有步骤数限制，一步步推进直到任务完成，不要因为步骤多而提前放弃
+- **失败换思路**：同一种方式失败 2 次后必须换策略（换定位方式、先滚动、用 check_page 确认状态），不要机械重复
+- **状态确认**：不确定当前页面状态时用 check_page，不要凭猜测做判断
+- **避免死循环**：不要连续重复完全相同的操作；系统会检测 3 次连续失败或重复操作并自动终止
+- **媒体先验证再等待**：不要盲目 wait。点击视频/音频链接后，操作反馈中会包含「媒体状态」，根据实际状态决策：未播放→点播放按钮，播放中→根据总时长计算 wait 秒数，已结束→当前完成，推进到下一个
+- **wait 参数合理**：wait 的秒数应根据媒体总时长或页面规则来设定，不要随意设置。如果不确定等多久，用 check_page 查看页面规则或媒体时长
 
 ## 元素定位
-- 优先从页面可交互元素列表中找目标文本，找到后直接 click_element
-- 如果列表中找不到目标文本（可能不在视口内），先 scroll_down 再查看新列表
-- 如果多次找不到，用 check_page 查看页面整体内容，确认元素是否存在
-- 如果操作失败，尝试不同的定位方式（按钮/链接/通用文本），不要放弃
 
-## 操作规则
-- 没有迭代次数限制，持续操作直到任务完成，不要因为步骤多而提前放弃
-- 操作失败时尝试其他方法（换个定位策略、先滚动、用 check_page 确认页面状态）
-- 不要连续重复完全相同的操作，如果一种方式失败 2 次就换思路
-- 新网站用 navigate；新标签页用 new_tab
+- 优先从页面可交互元素列表中匹配目标文本
+- 列表中找不到目标时（可能不在视口内），先 scroll_down 再看新列表
+- 多次找不到时用 check_page 确认元素是否确实存在于页面中
+- 操作失败时尝试不同的定位方式（精确文本/模糊文本/role/link/button/通用文本）
+
+## 标签页管理
+
+- 在当前标签页跳转用 navigate
+- 需要同时查看多个页面用 new_tab
 - 链接在新标签页打开时，用 list_tabs 检查并用 switch_tab 切换
-- 系统会自动检测 3 次连续失败或 3 次重复操作为死循环并终止，你只需专注于推进任务`
+
+## 任务完成
+
+- 对照任务要求逐一检查：所有条件都满足了吗？
+- 满足 → 调用 finish_task，简短说明完成情况
+- 不确定 → check_page 确认后再判断
+- 涉及登录/验证的任务：手动验证通过后页面通常会自动跳转，check_page 确认即可`
     },
     {
       role: "user",
-      content: `任务: ${task}\n\n当前 URL: ${page.url()}\n当前页面可交互元素:\n${await getPageState(page)}`
+      content: `任务: ${task}\n\n当前 URL: ${page.url()}\n当前页面可交互元素:\n${await getPageState(page)}\n\n[重要提醒] 请跟踪你的进度：如果某个子任务已完成（如视频已播放结束、页面已处理过），立即推进到下一个子任务，不要重复已完成的操作。`
     }
   ];
 
@@ -452,6 +801,29 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
   const recentOps: string[] = [];
   const MAX_IDENTICAL_OPS = 3;
 
+  // === 进度记忆：防止长对话中遗忘已完成步骤 ===
+  const actionLog: string[] = [];
+  const PROGRESS_INTERVAL = 8; // 每 8 轮注入一次进度摘要
+  let lastProgressInjection = 0;
+
+  const summarizeAction = (toolName: string, args: any, result: string): string => {
+    const short = result.length > 50 ? result.slice(0, 50) + "..." : result;
+    switch (toolName) {
+      case "navigate": return `导航到 ${args.url}`;
+      case "click_element": return `点击 "${args.name}" → ${short}`;
+      case "type_text": return `在 "${args.label}" 输入文本`;
+      case "scroll_down": return `向下滚动页面`;
+      case "check_page": return `查看页面状态`;
+      case "wait": return `等待 ${args.seconds}秒 (${args.reason || "未说明"})`;
+      case "switch_tab": return `切换到标签页 ${args.identifier}`;
+      case "new_tab": return `打开新标签页${args.url ? `: ${args.url}` : ""}`;
+      case "close_tab": return `关闭当前标签页`;
+      case "list_tabs": return `列出所有标签页`;
+      case "finish_task": return `完成任务: ${args.result}`;
+      default: return `${toolName} → ${short}`;
+    }
+  };
+
   while (iterations < MAX_ITERATIONS) {
     iterations++;
     console.log(`\n--- 循环 ${iterations} ---`);
@@ -461,7 +833,7 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
 
     // 调用 LLM
     const response = await openai.chat.completions.create({
-      model: "deepseek-v4-flash",
+      model: "deepseek-v4-pro",
       messages,
       tools,
       tool_choice: "auto"
@@ -509,6 +881,11 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
           console.log(`  ⚠️ 连续 ${MAX_IDENTICAL_OPS} 次相同操作，可能陷入循环`);
         }
 
+        // 记录到进度日志（finish_task 除外，它直接返回）
+        if (toolName !== "finish_task") {
+          actionLog.push(summarizeAction(toolName, args, result));
+        }
+
         // 3. 如果任务完成，返回结果（不关闭浏览器）
         if (toolName === "finish_task") {
           console.log("最终结果:", args.result);
@@ -523,6 +900,30 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
         page = getActivePage(browser);
         const newState = await getPageState(page);
 
+        // 4.5 轻量媒体状态检测（让 Agent 知道视频/音频是否在播放）
+        let mediaStatus = "";
+        try {
+          const mediaInfo: string[] = await page.evaluate(() => {
+            const items: string[] = [];
+            document.querySelectorAll("video, audio").forEach(el => {
+              const m = el as HTMLMediaElement;
+              const style = window.getComputedStyle(m);
+              if (style.display === "none" || style.visibility === "hidden") return;
+              const rect = m.getBoundingClientRect();
+              if (rect.width === 0 && rect.height === 0) return;
+              const state = m.ended ? "已结束" : m.paused ? "已暂停" : "播放中";
+              const dur = isFinite(m.duration) && m.duration > 0 ? Math.round(m.duration) : null;
+              const cur = Math.round(m.currentTime);
+              const durStr = dur !== null ? `/${dur}秒` : "";
+              items.push(`${m.tagName.toLowerCase()} ${state} ${cur}秒${durStr}`);
+            });
+            return items;
+          });
+          if (mediaInfo.length > 0) {
+            mediaStatus = `\n媒体状态: ${mediaInfo.join("; ")}`;
+          }
+        } catch { /* 忽略媒体检测失败 */ }
+
         // 5. 检测是否遇到了验证/拦截页面
         if (await detectVerificationPage(page)) {
           await waitForManualVerification(rl);
@@ -531,7 +932,7 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
-            content: `工具执行结果: ${result}\n\n⚠️ 遇到验证页面，已手动完成验证。\n操作后的页面 URL: ${page.url()}\n操作后可交互元素:\n${restoredState}`
+            content: `工具执行结果: ${result}\n\n⚠️ 遇到验证页面，已手动完成验证。\n操作后的页面 URL: ${page.url()}${mediaStatus}\n操作后可交互元素:\n${restoredState}`
           });
           continue;
         }
@@ -540,9 +941,20 @@ async function runAgent(browser: Browser, task: string, startUrl?: string, rl?: 
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: `工具执行结果: ${result}\n\n操作后的页面 URL: ${page.url()}\n操作后可交互元素:\n${newState}`
+          content: `工具执行结果: ${result}\n\n操作后的页面 URL: ${page.url()}${mediaStatus}\n操作后可交互元素:\n${newState}`
         });
       }
+    }
+
+    // === 定期注入进度摘要，防止 LLM 遗忘已完成步骤 ===
+    if (actionLog.length > 0 && iterations - lastProgressInjection >= PROGRESS_INTERVAL) {
+      const summary = actionLog.map((entry, i) => `${lastProgressInjection + i + 1}. ${entry}`).join("\n");
+      messages.push({
+        role: "user",
+        content: `[任务进度回顾 — 以下是最近完成的操作，请勿重复：]\n已完成 ${lastProgressInjection + actionLog.length} 步操作：\n${summary}\n\n请检查：哪些子任务已经完成？还有哪些未完成？继续向目标推进，不要重复已完成的步骤。`
+      });
+      lastProgressInjection += actionLog.length;
+      actionLog.length = 0; // 清空已注入的日志
     }
 
     // 检查智能终止条件
