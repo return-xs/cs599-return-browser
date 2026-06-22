@@ -46,8 +46,9 @@ cd src
 npx tsx agent.ts
 ```
 
-## 项目状态
+## Demo
 
-- [x] Proposal
-- [x] MVP
-- [x] Final
+> 指令：
+> 登录学习强国，打开积分中心，根据各任务要求，完成任务获取积分
+
+<img src="./docs/demo.png"/>
